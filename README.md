@@ -86,6 +86,7 @@ Replay runs the real agent loop but answers every tool call from the capture. Th
 1. **Every tool call is vetoed at `pre_tool_call`.** Nothing reaches your shell, filesystem, network or APIs while a case is armed.
 2. **Only an arg-identical recorded call is served.** A different command with the same tool name is not answered from a fixture, it is blocked and recorded as a gap: replaying the output of a different command would answer the wrong question.
 3. **Armed replay state expires.** `~/.hermes/regress/replay/armed.json` carries `expires_at` (15 min default), and the hook re-reads it on every call. A crashed or abandoned run disarms itself.
+4. **A runtime that skips the hook is caught, not trusted.** Every armed call appends a line to `replay/hook.log`. If a case has tool calls and the trace shows no hook activity, that case is marked `error` and the suite stops instead of replaying the rest with live tools. This is how you find out that the process serving your turns does not load plugins.
 
 Before any run, `preflight()` replays a probe case. If the runtime does not intercept it, the run aborts with an explanation instead of executing real tools. `/regress selftest` runs the same probe on demand.
 
