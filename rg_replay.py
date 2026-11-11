@@ -30,15 +30,7 @@ TRACE_ENV = "REGRESS_TRACE"
 DEBUG_ENV = "REGRESS_DEBUG_LOG"
 
 def _env(name: str) -> str:
-    """Best-effort read of a debugging variable from either env channel."""
-    try:
-        from agent.session_client_env import session_env
-
-        value = session_env(name, "")
-        if value:
-            return str(value)
-    except Exception:
-        pass
+    """Read a debugging variable from this process's environment."""
     return os.environ.get(name, "")
 
 

@@ -4,6 +4,7 @@ description: "Turns your real Hermes sessions into a replayable regression suite
 author: "Harish Kotra (@harishkotra)"
 license: MIT
 homepage: https://github.com/harishkotra/hermes-regress
+requires_hermes: ">=0.22.0"
 provides_hooks:
   - post_tool_call
   - post_llm_call
