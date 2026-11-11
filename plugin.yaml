@@ -1,0 +1,13 @@
+name: regress
+version: 0.1.0
+description: "Turns your real Hermes sessions into a replayable regression suite. Capture each turn's tool calls and outputs, replay them against a different model or config with every side effect stubbed out, and get a per-case pass/drift/regressed report."
+author: "Harish Kotra (@harishkotra)"
+license: MIT
+homepage: https://github.com/harishkotra/hermes-regress
+provides_hooks:
+  - post_tool_call
+  - post_llm_call
+  - pre_tool_call
+  - on_session_end
+provides_commands:
+  - regress
