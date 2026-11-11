@@ -146,14 +146,40 @@ def serve(*, tool_name: str = "", args: Any = None, **_: Any) -> dict[str, Any]:
         matched = best[1]
         consumed.add(matched)
         payload = case["tool_calls"][matched].get("result") or "[hermes-regress replay] recorded output was empty."
-    _trace({
+    entry = {
         "case_id": case.get("case_id"),
         "tool": tool_name,
         "args": args if isinstance(args, dict) else {"_raw": str(args)},
         "fixture_index": matched,
         "exact": bool(best and best[0] == 3),
-    }, case)
+    }
+    _trace(entry, case)
+    _hooklog(entry)
     return {"action": "block", "message": payload}
+
+
+def _hooklog(entry: dict[str, Any]) -> None:
+    """Append one line to replay/hook.log for every call seen while a case is armed.
+
+    This is the honest answer to "did the hook fire?" during a live run: if the
+    armed window produced no lines here, the runtime executing the tool does not
+    load this plugin and no replay happened.
+    """
+    try:
+        from . import rg_store
+
+        home = rg_store.regress_home()
+    except Exception:
+        return
+    path = os.path.join(home, "replay", "hook.log")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        entry = dict(entry)
+        entry.setdefault("ts", datetime.now().isoformat(timespec="seconds"))
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, default=str) + "\n")
+    except OSError:
+        pass
 
 
 def _debug(message: str) -> None:
@@ -395,6 +421,18 @@ def run_case(case: dict[str, Any], *, model: str | None = None, timeout: int | N
         "expectations": check_expectations(case.get("expect", []), output),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
     }
+    stale_armed = armed_case()
+    if stale_armed is not None:
+        disarm()
+    if case.get("tool_calls") and not replayed:
+        result["verdict"] = "error"
+        result["error"] = (
+            "no pre_tool_call activity during the replay: this runtime never consulted the hook, "
+            "so the case's tool calls would have executed for real. Run /regress selftest in the "
+            "runtime that serves your turns."
+        )
+        shutil.rmtree(workdir, ignore_errors=True)
+        return result
     result["verdict"] = verdict_for(result, case, cfg)
     shutil.rmtree(workdir, ignore_errors=True)
     return result
@@ -416,6 +454,9 @@ def run_suite(*, model: str | None = None, case_id: str | None = None, limit: in
             progress(index, len(cases), case)
         results.append(run_case(case, model=model, timeout=timeout, cfg=cfg,
                                extra_args=extra_args))
+        if str(results[-1].get("error", "")).startswith("no pre_tool_call activity"):
+            # Every remaining case would execute its tools for real. Stop here.
+            break
     summary = summarize(results)
     payload = {
         "schema": store.SCHEMA,
