@@ -213,5 +213,78 @@ class TestReporting(TempHome):
         self.assertTrue(any(n.endswith("manifest.json") for n in names))
 
 
+class ReviewFixes(TempHome):
+    """The four blocking items from the 877c6df review."""
+
+    def test_veto_is_scoped_to_the_replay_process(self) -> None:
+        case = self.make_case()
+        rg_replay.arm(case, session_token="tok-abc")
+        # Another gateway session (no token): must be untouched.
+        self.assertEqual(rg_replay.serve(tool_name="terminal", args={"command": "ls"},
+                                        session_id="other-chat"), {})
+        hooklog = store.regress_home() / "replay" / "hook.log"
+        self.assertFalse(hooklog.exists(), "unrelated sessions must not even be logged")
+        # The replay child carries the token and gets the fixture.
+        os.environ[rg_replay.REPLAY_TOKEN_ENV] = "tok-abc"
+        try:
+            out = rg_replay.serve(tool_name=case["tool_calls"][0]["tool"],
+                                 args=case["tool_calls"][0]["args"], session_id="child")
+        finally:
+            os.environ.pop(rg_replay.REPLAY_TOKEN_ENV, None)
+        self.assertEqual(out.get("action"), "block")
+        self.assertTrue(hooklog.exists())
+        self.assertIn(case["case_id"], hooklog.read_text())
+
+    def test_hook_fails_closed_on_internal_error(self) -> None:
+        case = self.make_case()
+        rg_replay.arm(case, session_token="tok-err")
+        original = rg_replay._serve
+        rg_replay._serve = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        os.environ[rg_replay.REPLAY_TOKEN_ENV] = "tok-err"
+        try:
+            out = rg_replay.serve(tool_name=case["tool_calls"][0]["tool"],
+                                 args=case["tool_calls"][0]["args"])
+        finally:
+            rg_replay._serve = original
+            os.environ.pop(rg_replay.REPLAY_TOKEN_ENV, None)
+        self.assertEqual(out.get("action"), "block")
+        self.assertIn("not run", out.get("message", ""))
+
+    def test_prompt_answer_and_args_are_redacted(self) -> None:
+        rg_replay.disarm()
+        rg_capture.on_post_tool_call(
+            tool_name="terminal",
+            args={"command": "curl -H 'Authorization: Bearer sk-live-9f8e7d6c5b4a' https://x"},
+            result="ok", ok=True, duration_ms=1)
+        rg_capture.on_post_llm_call(
+            user_message="use key sk-live-9f8e7d6c5b4a to list my repos",
+            assistant_response="done with sk-live-9f8e7d6c5b4a",
+            session_id="s1", turn_id="t1", model="m", platform="cli")
+        files = list((store.regress_home() / "cases").glob("*.json"))
+        self.assertEqual(len(files), 1)
+        blob = files[0].read_text()
+        self.assertNotIn("sk-live-9f8e7d6c5b4a", blob)
+        self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
+
+    def test_replay_turn_is_not_captured_as_a_case(self) -> None:
+        rg_replay.arm(self.make_case(), session_token="tok-cap")
+        rg_capture.on_post_tool_call(tool_name="terminal", args={"command": "ls"}, result="x")
+        rg_capture.on_post_llm_call(user_message="hi there, replaying now",
+                                    assistant_response="a",
+                                    session_id="s2", turn_id="t2", model="m")
+        cases = list((store.regress_home() / "cases").glob("*.json"))
+        self.assertEqual(cases, [])
+
+    def test_show_hides_tool_payloads_by_default(self) -> None:
+        import rg_cli
+
+        store.save_case(self.make_case())
+        hidden = rg_cli.cmd_show([self.make_case()["case_id"]])
+        self.assertIn("hidden", hidden)
+        self.assertNotIn('"command"', hidden)
+        full = rg_cli.cmd_show([self.make_case()["case_id"], "--full"])
+        self.assertIn("echo hello", full)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

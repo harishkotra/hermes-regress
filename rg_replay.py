@@ -16,6 +16,7 @@ import difflib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from typing import Any
 import rg_store as store
 
 TRACE_ENV = "REGRESS_TRACE"
+REPLAY_TOKEN_ENV = "HERMES_REGRESS_REPLAY_TOKEN"
 DEBUG_ENV = "REGRESS_DEBUG_LOG"
 
 def _env(name: str) -> str:
@@ -45,7 +47,8 @@ def arm_path() -> Path:
     return store.regress_home() / "replay" / "armed.json"
 
 
-def arm(case: dict[str, Any], *, ttl_s: int = 900, trace_path: str = "") -> Path:
+def arm(case: dict[str, Any], *, ttl_s: int = 900, trace_path: str = "",
+        session_token: str = "", session_id: str = "") -> Path:
     """Publish a case as the active replay fixture set.
 
     Node: the replayed turn runs in the Hermes gateway process, which is not
@@ -60,6 +63,8 @@ def arm(case: dict[str, Any], *, ttl_s: int = 900, trace_path: str = "") -> Path
         "prompt": (case.get("prompt") or "")[:200],
         "tool_calls": case.get("tool_calls", []),
         "trace_path": trace_path or "",
+        "session_token": session_token or "",
+        "session_id": session_id or "",
         "expires_at": time.time() + ttl_s,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -124,11 +129,42 @@ def _score(recorded: dict[str, Any], tool: str, args: Any) -> int:
     return 0
 
 
-def serve(*, tool_name: str = "", args: Any = None, **_: Any) -> dict[str, Any]:
-    _debug(f"serve called tool={tool_name}")
+def _in_scope(case: dict[str, Any], session_id: str, task_id: str) -> bool:
+    """Only the replay's own turn may be served a fixture.
+
+    The replay runs inside the user's gateway, so an armed window would
+    otherwise veto or answer every tool call from every other chat, messaging
+    session and cron run. The runner tags the child process it spawns with a
+    token, and the hook accepts nothing else.
+    """
+    token = str(case.get("session_token") or "")
+    if not token:
+        return True  # in-process probe: nothing else is running
+    if os.environ.get(REPLAY_TOKEN_ENV, "") == token:
+        return True
+    recorded_session = str(case.get("session_id") or "")
+    return bool(recorded_session) and str(session_id or "") == recorded_session
+
+
+def serve(*, tool_name: str = "", args: Any = None, session_id: str = "",
+          task_id: str = "", **_: Any) -> dict[str, Any]:
     case = _load_fixtures()
-    if case is None:
+    if case is None or not _in_scope(case, session_id, task_id):
         return {}
+    try:
+        return _serve(case, tool_name, args)
+    except Exception as exc:  # fail closed: a bug here must not run the real tool
+        entry = {"case_id": case.get("case_id"), "tool": tool_name,
+                 "error": f"{type(exc).__name__}: {exc}"}
+        _hooklog(entry)
+        return {
+            "action": "block",
+            "message": "[hermes-regress replay] fixture lookup failed; this tool call was not run.",
+        }
+
+
+def _serve(case: dict[str, Any], tool_name: str, args: Any) -> dict[str, Any]:
+    _debug(f"serve called tool={tool_name}")
     consumed = _STATE["consumed"]
     best: tuple[int, int] | None = None
     for idx, recorded in enumerate(case.get("tool_calls", [])):
@@ -165,19 +201,16 @@ def _hooklog(entry: dict[str, Any]) -> None:
     armed window produced no lines here, the runtime executing the tool does not
     load this plugin and no replay happened.
     """
+    path = store.regress_home() / "replay" / "hook.log"
     try:
-        from . import rg_store
-
-        home = rg_store.regress_home()
-    except Exception:
-        return
-    path = os.path.join(home, "replay", "hook.log")
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         entry = dict(entry)
-        entry.setdefault("ts", datetime.now().isoformat(timespec="seconds"))
+        entry.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()))
+        new = not path.exists()
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, default=str) + "\n")
+        if new:
+            os.chmod(path, 0o600)
     except OSError:
         pass
 
@@ -375,7 +408,9 @@ def run_case(case: dict[str, Any], *, model: str | None = None, timeout: int | N
 
     env = dict(os.environ)
     env[TRACE_ENV] = str(trace_path)
-    arm(case, ttl_s=max(120, timeout + 60), trace_path=str(trace_path))
+    token = secrets.token_hex(8)
+    env[REPLAY_TOKEN_ENV] = token
+    arm(case, ttl_s=max(120, timeout + 60), trace_path=str(trace_path), session_token=token)
 
     started = time.time()
     error = ""

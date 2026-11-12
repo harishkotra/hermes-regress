@@ -163,14 +163,27 @@ def build_case(*, session_id: str, turn_id: str, prompt: str, answer: str,
     excluded = {str(t) for t in cfg.get("exclude_tools", [])}
     calls = [c for c in calls if c["tool"] and c["tool"].split(":")[0] not in excluded]
 
+    case_id = store.case_id_for(session_id, turn_id, prompt)
     redactions = 0
     if cfg.get("redact", True):
         for call in calls:
-            text, n = redact(call["result"])
-            call["result"] = text
+            call["result"], n = redact(call["result"] or "")
             redactions += n
+            # Arguments carry secrets too: a curl with a bearer header, a
+            # psql with a password, an api_key in a JSON body.
+            raw_args = json.dumps(call.get("args", {}), default=str)
+            clean_args, n = redact(raw_args)
+            redactions += n
+            if n:
+                try:
+                    call["args"] = json.loads(clean_args)
+                except ValueError:
+                    call["args"] = {"_redacted": clean_args}
+        prompt, n = redact(prompt or "")
+        redactions += n
+        answer, n = redact(answer or "")
+        redactions += n
 
-    case_id = store.case_id_for(session_id, turn_id, prompt)
     return {
         "schema": store.SCHEMA,
         "case_id": case_id,
@@ -190,9 +203,26 @@ def build_case(*, session_id: str, turn_id: str, prompt: str, answer: str,
     }
 
 
+def _in_replay() -> bool:
+    """True while a case is armed: a replay's own turns must not become cases.
+
+    The env var covers a child process started by an older runner; armed_case()
+    is the real signal, because the replay turn runs in a separate process that
+    never shares our memory.
+    """
+    if os.environ.get("HERMES_REGRESS_REPLAY"):
+        return True
+    try:
+        import rg_replay
+
+        return rg_replay.armed_case() is not None
+    except Exception:
+        return False
+
+
 def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = None,
                       ok: Any = None, duration_ms: Any = None, **_: Any) -> None:
-    if os.environ.get("HERMES_REGRESS_REPLAY"):
+    if _in_replay():
         return
     if not store.load_config().get("capture", True):
         return
@@ -202,7 +232,7 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
 def on_post_llm_call(*, session_id: str = "", turn_id: str = "", user_message: Any = None,
                      assistant_response: Any = None, conversation_history: Any = None,
                      model: str = "", platform: str = "", **_: Any) -> None:
-    if os.environ.get("HERMES_REGRESS_REPLAY"):
+    if _in_replay():
         return
     if not store.load_config().get("capture", True):
         return

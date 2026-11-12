@@ -38,11 +38,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def regress_home() -> Path:
+    """Where cases live: the active Hermes home, under plugin-data.
+
+    get_hermes_home() is the same resolver the rest of Hermes uses, so a
+    gateway running several profiles writes each profile's cases into that
+    profile's home instead of one shared ~/.hermes/regress.
+    """
     override = os.environ.get("HERMES_REGRESS_HOME")
     if override:
         return Path(override).expanduser()
-    base = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return Path(base).expanduser() / "regress"
+    try:
+        from hermes_constants import get_hermes_home
+
+        base = Path(get_hermes_home())
+    except Exception:
+        base = Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+    return base.expanduser() / "plugin-data" / "hermes-regress"
 
 
 def ensure_dirs() -> Path:
@@ -77,11 +88,25 @@ def case_id_for(session_id: str, turn_id: str, prompt: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def write_private(path: Path, text: str) -> Path:
+    """Write a file only the owner can read.
+
+    Cases hold prompts, answers and tool arguments, so they are 0600: a shared
+    box or a synced home should not leak them to another account.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return path
+
+
 def save_case(case: dict[str, Any]) -> Path:
     home = ensure_dirs()
-    path = home / "cases" / f"{case['case_id']}.json"
-    path.write_text(json.dumps(case, indent=2, sort_keys=True) + "\n", "utf-8")
-    return path
+    return write_private(home / "cases" / f"{case['case_id']}.json",
+                         json.dumps(case, indent=2, sort_keys=True) + "\n")
 
 
 def load_case(case_id: str) -> dict[str, Any] | None:

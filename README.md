@@ -24,7 +24,7 @@ Benchmarks do not cover this, because the tasks you care about are the ones you 
 
 ```bash
 git clone https://github.com/harishkotra/hermes-regress ~/hermes-regress
-ln -s ~/hermes-regress ~/.hermes/plugins/regress
+ln -s ~/hermes-regress ~/.hermes/plugins/hermes-regress
 hermes plugins enable regress
 ```
 
@@ -37,7 +37,7 @@ Capture is passive. There is nothing to switch on: install, restart, and work as
 ```
 /regress status                    capture on/off, case count, last run
 /regress list 10                   newest cases
-/regress show a1b2c3d4             prompt, tool calls, recorded answer
+/regress show a1b2c3d4             turn summary; --full adds arguments and outputs
 /regress expect a1b2c3d4 "tests pass"    add a must-appear assertion
 /regress run --model gpt-5         replay every case against another model
 /regress run --case a1b2c3d4 --limit 5
@@ -57,7 +57,7 @@ Exit codes: `0` clean, `1` error, `2` a case regressed.
 
 ## What a case is
 
-A plain JSON file under `~/.hermes/regress/cases/`. Readable, diffable, safe to commit.
+A plain JSON file under `$HERMES_HOME/plugin-data/hermes-regress/cases/` (mode 0600). Readable, diffable, safe to commit once you have read it.
 
 ```json
 {
@@ -84,13 +84,16 @@ A plain JSON file under `~/.hermes/regress/cases/`. Readable, diffable, safe to 
 Replay runs the real agent loop but answers every tool call from the capture. Three rules enforce that:
 
 1. **Every tool call is vetoed at `pre_tool_call`.** Nothing reaches your shell, filesystem, network or APIs while a case is armed.
+2. **The veto only applies to the replay's own turn.** The replay runs inside your gateway, so an unscoped veto would freeze every other chat, messaging session and cron job for minutes. When arming, the runner tags the child process with a random token; the hook answers `{}` for anything that does not carry it. Your other sessions keep working normally.
+3. **The hook fails closed.** If fixture lookup raises while a case is armed, `serve()` still returns a block, so a bug in this plugin cannot turn a replay into a live run.
+4. **A replay never becomes a case.** Capture is skipped whenever a case is armed, so `/regress run` cannot feed its own output back into the suite.
 2. **Only an arg-identical recorded call is served.** A different command with the same tool name is not answered from a fixture, it is blocked and recorded as a gap: replaying the output of a different command would answer the wrong question.
-3. **Armed replay state expires.** `~/.hermes/regress/replay/armed.json` carries `expires_at` (15 min default), and the hook re-reads it on every call. A crashed or abandoned run disarms itself.
-4. **A runtime that skips the hook is caught, not trusted.** Every armed call appends a line to `replay/hook.log`. If a case has tool calls and the trace shows no hook activity, that case is marked `error` and the suite stops instead of replaying the rest with live tools. This is how you find out that the process serving your turns does not load plugins.
+5. **Armed replay state expires.** `plugin-data/hermes-regress/replay/armed.json` carries `expires_at` (15 min default), and the hook re-reads it on every call. A crashed or abandoned run disarms itself.
+6. **A runtime that skips the hook is caught, not trusted.** Every armed call appends a line to `replay/hook.log`. If a case has tool calls and the trace shows no hook activity, that case is marked `error` and the suite stops instead of replaying the rest with live tools. This is how you find out that the process serving your turns does not load plugins.
 
 Before any run, `preflight()` replays a probe case. If the runtime does not intercept it, the run aborts with an explanation instead of executing real tools. `/regress selftest` runs the same probe on demand.
 
-Captured text passes through a redaction layer first: provider keys (`sk-`, `pk-`, `rk-`), GitHub tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`), Slack tokens, AWS access keys, JWTs, inline `password=` / `token=` / `api_key=` values, and long hex strings are replaced with `[REDACTED]` before anything is written to disk. The count lands in the case as `redactions`.
+Everything written to disk passes through a redaction layer first: the prompt, the answer, every tool result and every set of tool arguments (a `curl -H "Authorization: Bearer ..."` never lands raw). Provider keys (`sk-`, `pk-`, `rk-`), GitHub tokens, Slack tokens, AWS access keys, JWTs, inline `password=` / `token=` / `api_key=` values and long hex strings become `[REDACTED]`. Case files are written 0600, and the redaction count lands in the case as `redactions`.
 
 ## Verdicts
 
@@ -101,7 +104,7 @@ Captured text passes through a redaction layer first: provider keys (`sk-`, `pk-
 | `regressed` | An expectation missing, a tool step dropped, or similarity under threshold. |
 | `error` | The replay itself failed: timeout, provider error, runtime not intercepting. |
 
-Thresholds live in `~/.hermes/regress/config.json` (`threshold`, `plan_threshold`). Expectations always win over similarity: add one with `/regress expect` for the part that must never change.
+Thresholds live in `plugin-data/hermes-regress/config.json` (`threshold`, `plan_threshold`). Expectations always win over similarity: add one with `/regress expect` for the part that must never change.
 
 ## Evidence bundle
 
@@ -109,7 +112,7 @@ Thresholds live in `~/.hermes/regress/config.json` (`threshold`, `plan_threshold
 
 ## Verified
 
-- `python3 -m unittest discover -s tests` runs 18 tests covering redaction, the case store, hash chain, arming and expiry, fixture matching, unrecorded-tool blocking, verdicts, expectations, markdown, JUnit and the export bundle.
+- `python3 -m unittest discover -s tests` runs 23 tests covering redaction, the case store, hash chain, arming and expiry, fixture matching, unrecorded-tool blocking, verdicts, expectations, markdown, JUnit and the export bundle.
 - Capture is exercised against real turns: 28 cases recorded from live sessions while this plugin was developed, including turns that ran shell commands.
 - Hook serving is exercised through the real dispatch path (`get_pre_tool_call_block_message` returns a block with the recorded output and writes the trace line).
 

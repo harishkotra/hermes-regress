@@ -80,8 +80,17 @@ def cmd_list(argv: list[str]) -> str:
 
 
 def cmd_show(argv: list[str]) -> str:
+    """Case detail.
+
+    A slash command runs wherever the gateway is reachable, including a shared
+    channel, and a handler cannot see who sent it. So the default view shows the
+    turn, not the tool payloads; pass --full on your own machine when you need
+    the exact arguments and outputs.
+    """
     if not argv:
-        return "Usage: /regress show <case_id>"
+        return "Usage: /regress show <case_id> [--full]"
+    full = "--full" in argv
+    argv = [a for a in argv if a != "--full"]
     case = store.load_case(argv[0])
     if not case:
         matches = [c for c in store.list_cases() if c["case_id"].startswith(argv[0])]
@@ -96,9 +105,14 @@ def cmd_show(argv: list[str]) -> str:
         f"tools: {', '.join(c['tool'] for c in case.get('tool_calls', [])) or '(none)'}",
     ]
     for index, call in enumerate(case.get("tool_calls", [])[:5]):
-        preview = (call.get("result") or "")[:160].replace("\n", " ")
-        lines.append(f"  [{index}] {call['tool']} {json.dumps(call.get('args', {}))[:120]}")
-        lines.append(f"      -> {preview}")
+        if full:
+            preview = (call.get("result") or "")[:160].replace("\n", " ")
+            lines.append(f"  [{index}] {call['tool']} {json.dumps(call.get('args', {}))[:120]}")
+            lines.append(f"      -> {preview}")
+        else:
+            lines.append(f"  [{index}] {call['tool']}")
+    if case.get("tool_calls") and not full:
+        lines.append("(tool arguments and outputs hidden; rerun with --full on your own machine)")
     if case.get("expect"):
         lines.append(f"expects: {case['expect']}")
     return "\n".join(lines)
