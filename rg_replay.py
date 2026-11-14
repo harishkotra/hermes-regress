@@ -16,7 +16,6 @@ import difflib
 import json
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import sys
@@ -28,7 +27,7 @@ from typing import Any
 import rg_store as store
 
 TRACE_ENV = "REGRESS_TRACE"
-REPLAY_TOKEN_ENV = "HERMES_REGRESS_REPLAY_TOKEN"
+CLAIM_ENV = "HERMES_REGRESS_REPLAY_SESSION"
 DEBUG_ENV = "REGRESS_DEBUG_LOG"
 
 def _env(name: str) -> str:
@@ -47,29 +46,60 @@ def arm_path() -> Path:
     return store.regress_home() / "replay" / "armed.json"
 
 
+def _write_armed(payload: dict[str, Any]) -> Path:
+    """Publish the armed payload atomically, readable only by its owner."""
+    path = arm_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    _STATE.update({"case": None, "consumed": set(), "path": None, "checked": 0.0})
+    return path
+
+
+def prompt_matches(recorded: str, incoming: str) -> bool:
+    """Whitespace-insensitive compare, with a prefix fallback for long prompts."""
+    def norm(text: str) -> str:
+        return " ".join((text or "").split())
+
+    left, right = norm(recorded), norm(incoming)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    marker = " ".join(left.split()[:40])
+    return bool(marker) and right.startswith(marker)
+
+
 def arm(case: dict[str, Any], *, ttl_s: int = 900, trace_path: str = "",
-        session_token: str = "", session_id: str = "") -> Path:
+        claimed_session_id: str = "") -> Path:
     """Publish a case as the active replay fixture set.
 
     Node: the replayed turn runs in the Hermes gateway process, which is not
     our child process, so a module global or an env var cannot carry this
     state across. A short-lived file the hook re-reads is the one channel both
     processes share.
+
+    ``claimed_session_id`` is empty until the replay's own turn is seen: the
+    runner cannot know the gateway's session id up front, so ``claim_session``
+    fills it in from ``pre_llm_call`` on the first turn whose message matches
+    the recorded prompt. Until then nothing is served and nothing is blocked.
     """
-    path = arm_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "case_id": case.get("case_id"),
-        "prompt": (case.get("prompt") or "")[:200],
+        "prompt": (case.get("prompt") or "")[:4000],
         "tool_calls": case.get("tool_calls", []),
         "trace_path": trace_path or "",
-        "session_token": session_token or "",
-        "session_id": session_id or "",
+        "claimed_session_id": claimed_session_id or "",
+        "claimed_task_id": "",
+        "claimed_at": 0.0,
         "expires_at": time.time() + ttl_s,
     }
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    _STATE.update({"case": None, "consumed": set(), "path": None, "checked": 0.0})
-    return path
+    return _write_armed(payload)
 
 
 def disarm() -> None:
@@ -132,18 +162,41 @@ def _score(recorded: dict[str, Any], tool: str, args: Any) -> int:
 def _in_scope(case: dict[str, Any], session_id: str, task_id: str) -> bool:
     """Only the replay's own turn may be served a fixture.
 
-    The replay runs inside the user's gateway, so an armed window would
-    otherwise veto or answer every tool call from every other chat, messaging
-    session and cron run. The runner tags the child process it spawns with a
-    token, and the hook accepts nothing else.
+    The replay runs inside the user's gateway, where every other chat,
+    messaging session and cron run executes too. An armed window with no owner
+    would veto or answer all of their tool calls, so scope is the claimed
+    session id and nothing else. Env vars cannot carry this: they belong to the
+    child CLI process, while the hook runs in the gateway.
+
+    Unclaimed (the window before the replay's own turn starts) serves nobody,
+    which also means nobody is blocked.
     """
-    token = str(case.get("session_token") or "")
-    if not token:
-        return True  # in-process probe: nothing else is running
-    if os.environ.get(REPLAY_TOKEN_ENV, "") == token:
-        return True
-    recorded_session = str(case.get("session_id") or "")
-    return bool(recorded_session) and str(session_id or "") == recorded_session
+    claimed = str(case.get("claimed_session_id") or "")
+    if not claimed:
+        return False
+    return str(session_id or "") == claimed
+
+
+def claim_session(*, session_id: str = "", user_message: str = "", task_id: str = "",
+                  **_: Any) -> None:
+    """Bind the armed case to the session that is running the recorded prompt.
+
+    Called from ``pre_llm_call``, which is the earliest hook that sees both the
+    session id and the turn's user message. A session is claimed at most once;
+    every later turn, in every session, is out of scope.
+    """
+    case = armed_case()
+    if case is None or case.get("claimed_session_id"):
+        return
+    if not session_id or not prompt_matches(str(case.get("prompt") or ""), user_message):
+        return
+    case["claimed_session_id"] = str(session_id)
+    case["claimed_task_id"] = str(task_id or "")
+    case["claimed_at"] = time.time()
+    _write_armed(case)
+    _hooklog({"event": "claim", "case_id": case.get("case_id"),
+              "session_id": str(session_id), "tool": "", "args_key": ""})
+    _debug(f"claimed case {case.get('case_id')} for session {session_id}")
 
 
 def serve(*, tool_name: str = "", args: Any = None, session_id: str = "",
@@ -329,6 +382,9 @@ def preflight(*, timeout: int = 150, force: bool = False) -> dict[str, Any]:
     workdir = Path(tempfile.mkdtemp(prefix="regress-probe-"))
     trace_path = workdir / "trace.jsonl"
     trace_path.write_text("", encoding="utf-8")
+    # Armed unscoped on purpose: the probe's own turn claims it the same way a
+    # real case does, so this tests the scoping path rather than bypassing it.
+    # While unclaimed, other sessions get {} and are never blocked.
     arm(_PROBE, ttl_s=max(120, timeout), trace_path=str(trace_path))
     output = ""
     try:
@@ -339,6 +395,8 @@ def preflight(*, timeout: int = 150, force: bool = False) -> dict[str, Any]:
     except (subprocess.TimeoutExpired, OSError) as exc:
         output = f"probe failed: {exc}"
     finally:
+        armed_after = armed_case() or {}
+        claimed = str(armed_after.get("claimed_session_id") or "")
         disarm()
         try:
             hits = [l for l in trace_path.read_text("utf-8").splitlines() if l.strip()]
@@ -346,11 +404,15 @@ def preflight(*, timeout: int = 150, force: bool = False) -> dict[str, Any]:
             hits = []
         shutil.rmtree(workdir, ignore_errors=True)
 
-    ok = bool(hits)
-    detail = ("runtime intercepted the probe and served the recorded output"
-              if ok else
-              "runtime did not intercept a tool call, so replay would execute real tools. "
-              "Restart Hermes (plugins load at startup) and run /regress run again")
+    ok = bool(hits) and bool(claimed)
+    if ok:
+        detail = "runtime claimed the probe session and served the recorded output"
+    elif hits:
+        detail = ("the probe's tool call was served, but its session was never claimed, so "
+                  "scoping would not hold for a real case")
+    else:
+        detail = ("runtime did not intercept a tool call, so replay would execute real tools. "
+                  "Restart Hermes (plugins load at startup) and run /regress run again")
     _PREFLIGHT.update({"ok": ok, "detail": detail, "checked": time.time() + _PREFLIGHT_TTL})
     return {"ok": ok, "detail": detail, "output": output}
 
@@ -408,9 +470,7 @@ def run_case(case: dict[str, Any], *, model: str | None = None, timeout: int | N
 
     env = dict(os.environ)
     env[TRACE_ENV] = str(trace_path)
-    token = secrets.token_hex(8)
-    env[REPLAY_TOKEN_ENV] = token
-    arm(case, ttl_s=max(120, timeout + 60), trace_path=str(trace_path), session_token=token)
+    arm(case, ttl_s=max(120, timeout + 60), trace_path=str(trace_path))
 
     started = time.time()
     error = ""
@@ -426,6 +486,8 @@ def run_case(case: dict[str, Any], *, model: str | None = None, timeout: int | N
     except OSError as exc:
         error = f"could not start hermes: {exc}"
     duration_ms = int((time.time() - started) * 1000)
+    armed_after = armed_case() or {}
+    claimed_session = str(armed_after.get("claimed_session_id") or "")
     disarm()
 
     replayed: list[dict[str, Any]] = []
@@ -461,11 +523,19 @@ def run_case(case: dict[str, Any], *, model: str | None = None, timeout: int | N
         disarm()
     if case.get("tool_calls") and not replayed:
         result["verdict"] = "error"
-        result["error"] = (
-            "no pre_tool_call activity during the replay: this runtime never consulted the hook, "
-            "so the case's tool calls would have executed for real. Run /regress selftest in the "
-            "runtime that serves your turns."
-        )
+        if claimed_session:
+            result["error"] = (
+                "no pre_tool_call activity during the replay: this runtime never consulted the "
+                "hook, so the case's tool calls would have executed for real. Run /regress "
+                "selftest in the runtime that serves your turns."
+            )
+        else:
+            result["error"] = (
+                "the replay's own turn never claimed the armed case, so session scoping never "
+                "applied and its tool calls ran for real. That means the runtime did not fire "
+                "pre_llm_call/pre_tool_call for this turn, or the prompt no longer matches the "
+                "recorded one."
+            )
         shutil.rmtree(workdir, ignore_errors=True)
         return result
     result["verdict"] = verdict_for(result, case, cfg)
@@ -489,7 +559,8 @@ def run_suite(*, model: str | None = None, case_id: str | None = None, limit: in
             progress(index, len(cases), case)
         results.append(run_case(case, model=model, timeout=timeout, cfg=cfg,
                                extra_args=extra_args))
-        if str(results[-1].get("error", "")).startswith("no pre_tool_call activity"):
+        if str(results[-1].get("error", "")).startswith(
+                ("no pre_tool_call activity", "the replay's own turn never claimed")):
             # Every remaining case would execute its tools for real. Stop here.
             break
     summary = summarize(results)

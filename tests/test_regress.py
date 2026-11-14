@@ -110,9 +110,11 @@ class TestArmAndServe(TempHome):
     def test_armed_case_serves_fixture_and_writes_trace(self) -> None:
         trace = Path(self._tmp.name) / "trace.jsonl"
         trace.write_text("", encoding="utf-8")
-        rg_replay.arm(self.make_case(), ttl_s=60, trace_path=str(trace))
+        rg_replay.arm(self.make_case(), ttl_s=60, trace_path=str(trace),
+                      claimed_session_id="replay-session")
 
-        reply = rg_replay.serve(tool_name="terminal", args={"command": "echo hello"})
+        reply = rg_replay.serve(tool_name="terminal", args={"command": "echo hello"},
+                                session_id="replay-session")
         self.assertEqual(reply["action"], "block")
         self.assertIn("hello", reply["message"])
 
@@ -124,8 +126,9 @@ class TestArmAndServe(TempHome):
         self.assertEqual(rg_replay.serve(tool_name="terminal", args={"command": "ls"}), {})
 
     def test_unrecorded_tool_is_blocked_not_executed(self) -> None:
-        rg_replay.arm(self.make_case(), ttl_s=60)
-        reply = rg_replay.serve(tool_name="terminal", args={"command": "rm -rf /tmp/whatever"})
+        rg_replay.arm(self.make_case(), ttl_s=60, claimed_session_id="replay-session")
+        reply = rg_replay.serve(tool_name="terminal", args={"command": "rm -rf /tmp/whatever"},
+                                session_id="replay-session")
         self.assertEqual(reply["action"], "block")
         self.assertIn("not called during capture", reply["message"])
 
@@ -216,37 +219,62 @@ class TestReporting(TempHome):
 class ReviewFixes(TempHome):
     """The four blocking items from the 877c6df review."""
 
-    def test_veto_is_scoped_to_the_replay_process(self) -> None:
+    def test_veto_is_scoped_by_the_hooks_session_id(self) -> None:
+        """Scoping has to work through the hook's own argument, not process env.
+
+        The replay's turn executes inside the gateway process, so anything the
+        runner sets in its child CLI process is invisible here. The hook is
+        therefore keyed on session_id, claimed by pre_llm_call.
+        """
         case = self.make_case()
-        rg_replay.arm(case, session_token="tok-abc")
-        # Another gateway session (no token): must be untouched.
-        self.assertEqual(rg_replay.serve(tool_name="terminal", args={"command": "ls"},
-                                        session_id="other-chat"), {})
-        hooklog = store.regress_home() / "replay" / "hook.log"
-        self.assertFalse(hooklog.exists(), "unrelated sessions must not even be logged")
-        # The replay child carries the token and gets the fixture.
-        os.environ[rg_replay.REPLAY_TOKEN_ENV] = "tok-abc"
-        try:
-            out = rg_replay.serve(tool_name=case["tool_calls"][0]["tool"],
-                                 args=case["tool_calls"][0]["args"], session_id="child")
-        finally:
-            os.environ.pop(rg_replay.REPLAY_TOKEN_ENV, None)
+        rg_replay.arm(case)
+        call = case["tool_calls"][0]
+        # Unclaimed window: nobody is served, nobody is blocked.
+        self.assertEqual(rg_replay.serve(tool_name=call["tool"], args=call["args"],
+                                         session_id="some-other-chat"), {})
+        # Only a turn carrying the recorded prompt may claim the case.
+        rg_replay.claim_session(session_id="other-session",
+                                user_message="something completely unrelated")
+        self.assertEqual(rg_replay.armed_case()["claimed_session_id"], "")
+        rg_replay.claim_session(session_id="replay-session", user_message=case["prompt"])
+        self.assertEqual(rg_replay.armed_case()["claimed_session_id"], "replay-session")
+
+        # Every other session is untouched, even with the case armed.
+        self.assertEqual(rg_replay.serve(tool_name=call["tool"], args=call["args"],
+                                         session_id="some-other-chat"), {})
+        # The replay's own session gets the recorded fixture.
+        out = rg_replay.serve(tool_name=call["tool"], args=call["args"],
+                              session_id="replay-session")
         self.assertEqual(out.get("action"), "block")
-        self.assertTrue(hooklog.exists())
-        self.assertIn(case["case_id"], hooklog.read_text())
+        self.assertEqual(out.get("message"), call["result"])
+        hooklog = store.regress_home() / "replay" / "hook.log"
+        self.assertIn("claim", hooklog.read_text())
+
+    def test_unclaimed_window_blocks_nobody(self) -> None:
+        case = self.make_case()
+        rg_replay.arm(case)
+        for session in ("a", "b", "c"):
+            self.assertEqual(rg_replay.serve(tool_name="terminal", args={"command": "rm -rf /"},
+                                             session_id=session), {})
+
+    def test_claim_happens_once_and_ignores_later_turns(self) -> None:
+        case = self.make_case()
+        rg_replay.arm(case)
+        rg_replay.claim_session(session_id="first", user_message=case["prompt"])
+        rg_replay.claim_session(session_id="second", user_message=case["prompt"])
+        self.assertEqual(rg_replay.armed_case()["claimed_session_id"], "first")
 
     def test_hook_fails_closed_on_internal_error(self) -> None:
         case = self.make_case()
-        rg_replay.arm(case, session_token="tok-err")
+        rg_replay.arm(case, claimed_session_id="replay-session")
         original = rg_replay._serve
         rg_replay._serve = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
-        os.environ[rg_replay.REPLAY_TOKEN_ENV] = "tok-err"
         try:
             out = rg_replay.serve(tool_name=case["tool_calls"][0]["tool"],
-                                 args=case["tool_calls"][0]["args"])
+                                 args=case["tool_calls"][0]["args"],
+                                 session_id="replay-session")
         finally:
             rg_replay._serve = original
-            os.environ.pop(rg_replay.REPLAY_TOKEN_ENV, None)
         self.assertEqual(out.get("action"), "block")
         self.assertIn("not run", out.get("message", ""))
 
@@ -267,7 +295,7 @@ class ReviewFixes(TempHome):
         self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
 
     def test_replay_turn_is_not_captured_as_a_case(self) -> None:
-        rg_replay.arm(self.make_case(), session_token="tok-cap")
+        rg_replay.arm(self.make_case())
         rg_capture.on_post_tool_call(tool_name="terminal", args={"command": "ls"}, result="x")
         rg_capture.on_post_llm_call(user_message="hi there, replaying now",
                                     assistant_response="a",

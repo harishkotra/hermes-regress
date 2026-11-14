@@ -26,6 +26,7 @@ def register(ctx) -> None:
     from rg_replay import _debug
 
     _debug("register() called — plugin loaded")
+    ctx.register_hook("pre_llm_call", rg_replay.claim_session)
     ctx.register_hook("pre_tool_call", rg_replay.serve)
     ctx.register_hook("post_tool_call", rg_capture.on_post_tool_call)
     ctx.register_hook("post_llm_call", rg_capture.on_post_llm_call)
