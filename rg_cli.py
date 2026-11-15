@@ -184,7 +184,7 @@ def cmd_report(argv: list[str]) -> str:
         return f"No run {run_id}."
     md = rg_report.report_markdown(payload)
     path = store.run_dir(run_id, create=True) / "report.md"
-    path.write_text(md, "utf-8")
+    store.write_private(path, md)
     return md + f"\n\nSaved to {path}"
 
 

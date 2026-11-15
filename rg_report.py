@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -113,9 +114,9 @@ def export_bundle(payload: dict[str, Any]) -> Path:
         "chain_head": chain,
         "note": "sha256 chain over case files, in listed order. Recompute to verify nothing changed.",
     }
-    (directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", "utf-8")
-    (directory / "report.md").write_text(report_markdown(payload), "utf-8")
-    (directory / "junit.xml").write_text(junit_xml(payload), "utf-8")
+    store.write_private(directory / "manifest.json", json.dumps(manifest, indent=2) + "\n")
+    store.write_private(directory / "report.md", report_markdown(payload))
+    store.write_private(directory / "junit.xml", junit_xml(payload))
     bundle = directory / f"hermes-regress-{run_id}.zip"
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(directory / "results.json", "results.json")
@@ -124,4 +125,8 @@ def export_bundle(payload: dict[str, Any]) -> Path:
         zf.write(directory / "manifest.json", "manifest.json")
         for case in cases:
             zf.writestr(f"cases/{case['case_id']}.json", json.dumps(case, indent=2, sort_keys=True))
+    try:
+        os.chmod(bundle, 0o600)
+    except OSError:
+        pass
     return bundle

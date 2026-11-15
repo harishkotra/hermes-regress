@@ -12,6 +12,7 @@ model swap, a prompt edit, a plugin change, or a Hermes upgrade.
 
 from __future__ import annotations
 
+import contextlib
 import difflib
 import json
 import os
@@ -20,9 +21,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 import rg_store as store
 
@@ -46,11 +53,59 @@ def arm_path() -> Path:
     return store.regress_home() / "replay" / "armed.json"
 
 
-def _write_armed(payload: dict[str, Any]) -> Path:
-    """Publish the armed payload atomically, readable only by its owner."""
+def _lock_path() -> Path:
+    return arm_path().with_name("armed.lock")
+
+
+@contextlib.contextmanager
+def _armed_lock():
+    """Serialise the read-check-write on armed.json.
+
+    Chats, cron and kanban turns can all hit the hooks at the same moment, in
+    separate threads of the gateway. Without a lock two claimers read an
+    unclaimed payload, both write, and the loser's write lands after
+    ``disarm()`` -- resurrecting a window that should be gone.
+    """
+    path = _lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _read_armed() -> dict[str, Any] | None:
+    """Read armed.json straight from disk, bypassing the per-call cache."""
+    path = arm_path()
+    try:
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_armed(payload: dict[str, Any], *, require_present: bool = False) -> Path | None:
+    """Publish the armed payload atomically, readable only by its owner.
+
+    Callers hold ``_armed_lock()``. Each writer gets its own temp name so two
+    concurrent writers cannot clobber each other's file, and ``require_present``
+    makes the write conditional on armed.json still existing, so a claim that
+    raced a ``disarm()`` cannot bring the window back.
+    """
     path = arm_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
+    if require_present and not path.exists():
+        return None
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
     try:
         os.chmod(tmp, 0o600)
@@ -62,52 +117,53 @@ def _write_armed(payload: dict[str, Any]) -> Path:
 
 
 def prompt_matches(recorded: str, incoming: str) -> bool:
-    """Whitespace-insensitive compare, with a prefix fallback for long prompts."""
-    def norm(text: str) -> str:
-        return " ".join((text or "").split())
+    """Full equality after whitespace collapse, and nothing looser.
 
-    left, right = norm(recorded), norm(incoming)
-    if not left or not right:
-        return False
-    if left == right:
-        return True
-    marker = " ".join(left.split()[:40])
-    return bool(marker) and right.startswith(marker)
+    A prefix fallback let a cron, kanban or skill turn sharing the opening words
+    of a recorded prompt claim the case, after which the real replay ran live.
+    """
+    left = " ".join((recorded or "").split())
+    right = " ".join((incoming or "").split())
+    return bool(left) and left == right
 
 
 def arm(case: dict[str, Any], *, ttl_s: int = 900, trace_path: str = "",
-        claimed_session_id: str = "") -> Path:
+        claimed_session_id: str = "", claimed_task_id: str = "") -> Path:
     """Publish a case as the active replay fixture set.
 
-    Node: the replayed turn runs in the Hermes gateway process, which is not
-    our child process, so a module global or an env var cannot carry this
-    state across. A short-lived file the hook re-reads is the one channel both
+    Note: the replayed turn runs in the Hermes gateway process, which is not our
+    child process, so a module global or an env var cannot carry this state
+    across. A short-lived file the hook re-reads is the one channel both
     processes share.
 
     ``claimed_session_id`` is empty until the replay's own turn is seen: the
     runner cannot know the gateway's session id up front, so ``claim_session``
-    fills it in from ``pre_llm_call`` on the first turn whose message matches
-    the recorded prompt. Until then nothing is served and nothing is blocked.
+    fills it in from ``pre_llm_call`` on the first turn whose full message
+    matches the recorded prompt. Until then nothing is served and nothing is
+    blocked.
     """
     payload = {
         "case_id": case.get("case_id"),
-        "prompt": (case.get("prompt") or "")[:4000],
+        "prompt": case.get("prompt") or "",
         "tool_calls": case.get("tool_calls", []),
         "trace_path": trace_path or "",
         "claimed_session_id": claimed_session_id or "",
-        "claimed_task_id": "",
+        "claimed_task_id": claimed_task_id or "",
         "claimed_at": 0.0,
         "expires_at": time.time() + ttl_s,
     }
-    return _write_armed(payload)
+    with _armed_lock():
+        return _write_armed(payload)
 
 
 def disarm() -> None:
-    try:
-        arm_path().unlink()
-    except OSError:
-        pass
+    with _armed_lock():
+        try:
+            arm_path().unlink()
+        except OSError:
+            pass
     _STATE.update({"case": None, "consumed": set(), "path": None, "checked": 0.0})
+
 
 
 def armed_case() -> dict[str, Any] | None:
@@ -163,39 +219,51 @@ def _in_scope(case: dict[str, Any], session_id: str, task_id: str) -> bool:
     """Only the replay's own turn may be served a fixture.
 
     The replay runs inside the user's gateway, where every other chat,
-    messaging session and cron run executes too. An armed window with no owner
-    would veto or answer all of their tool calls, so scope is the claimed
-    session id and nothing else. Env vars cannot carry this: they belong to the
-    child CLI process, while the hook runs in the gateway.
+    messaging session and cron run executes too, so an armed window with no
+    owner would veto or answer all of their tool calls. Scope is the claimed
+    session id, and the claimed task id as well: context compression mid-turn
+    hands the agent a new session id while the task stays the same, and without
+    the task fallback every call after that point would run live.
 
     Unclaimed (the window before the replay's own turn starts) serves nobody,
     which also means nobody is blocked.
     """
-    claimed = str(case.get("claimed_session_id") or "")
-    if not claimed:
-        return False
-    return str(session_id or "") == claimed
+    claimed_session = str(case.get("claimed_session_id") or "")
+    if claimed_session and str(session_id or "") == claimed_session:
+        return True
+    claimed_task = str(case.get("claimed_task_id") or "")
+    if claimed_task and str(task_id or "") == claimed_task:
+        return True
+    return False
 
 
 def claim_session(*, session_id: str = "", user_message: str = "", task_id: str = "",
-                  **_: Any) -> None:
+                  is_first_turn: bool = False, **_: Any) -> None:
     """Bind the armed case to the session that is running the recorded prompt.
 
-    Called from ``pre_llm_call``, which is the earliest hook that sees both the
-    session id and the turn's user message. A session is claimed at most once;
-    every later turn, in every session, is out of scope.
+    Called from ``pre_llm_call``, the earliest hook that sees the session id,
+    the task id and the turn's user message. ``is_first_turn`` is required: a
+    later turn in an existing conversation can repeat a recorded prompt, and
+    only the top of a fresh session is the replay the runner started. A session
+    is claimed at most once; every later turn, in every session, is out of
+    scope.
     """
-    case = armed_case()
-    if case is None or case.get("claimed_session_id"):
+    if not is_first_turn or not session_id:
         return
-    if not session_id or not prompt_matches(str(case.get("prompt") or ""), user_message):
-        return
-    case["claimed_session_id"] = str(session_id)
-    case["claimed_task_id"] = str(task_id or "")
-    case["claimed_at"] = time.time()
-    _write_armed(case)
+    with _armed_lock():
+        case = _read_armed()
+        if case is None or case.get("claimed_session_id"):
+            return
+        if not prompt_matches(str(case.get("prompt") or ""), user_message):
+            return
+        case["claimed_session_id"] = str(session_id)
+        case["claimed_task_id"] = str(task_id or "")
+        case["claimed_at"] = time.time()
+        if _write_armed(case, require_present=True) is None:
+            return
     _hooklog({"event": "claim", "case_id": case.get("case_id"),
-              "session_id": str(session_id), "tool": "", "args_key": ""})
+              "session_id": str(session_id), "task_id": str(task_id or ""),
+              "tool": "", "args_key": ""})
     _debug(f"claimed case {case.get('case_id')} for session {session_id}")
 
 
@@ -428,6 +496,39 @@ def hermes_bin() -> str:
     return str(Path(sys.executable).with_name("hermes"))
 
 
+def live_execution_error(*, claimed_session: str, recorded_total: int, served: int,
+                         replay_calls: int) -> str:
+    """Say plainly whether this case's recorded tool calls ran for real.
+
+    This is a post-mortem, not a guard. Once the runtime has executed a tool
+    because scoping was wrong or the hook never ran, the plugin cannot undo it;
+    what it can do is refuse to report that run as a clean replay.
+    """
+    if not recorded_total:
+        return ""
+    if not claimed_session:
+        return (
+            "the replay's own turn never claimed the armed case, so scoping never applied and "
+            f"its {recorded_total} recorded tool call(s) ran for real. This is detected after "
+            "the case, not prevented: check replay/hook.log and whether the runtime serving "
+            "turns loads plugins."
+        )
+    if not replay_calls:
+        return (
+            f"no pre_tool_call activity during the replay, so its {recorded_total} recorded "
+            "tool call(s) ran for real. Detected after the case, not prevented. Run "
+            "/regress selftest in the runtime that serves your turns."
+        )
+    if served < recorded_total:
+        return (
+            f"only {served} of {recorded_total} recorded tool calls were answered from the "
+            f"recording; the other {recorded_total - served} ran for real. Detected after the "
+            "case, not prevented, so treat this run's tool side effects as real. See "
+            "replay/hook.log."
+        )
+    return ""
+
+
 def run_case(case: dict[str, Any], *, model: str | None = None, timeout: int | None = None,
              cfg: dict[str, Any] | None = None, extra_args: list[str] | None = None) -> dict[str, Any]:
     cfg = cfg or store.load_config()
@@ -488,6 +589,7 @@ def run_case(case: dict[str, Any], *, model: str | None = None, timeout: int | N
     duration_ms = int((time.time() - started) * 1000)
     armed_after = armed_case() or {}
     claimed_session = str(armed_after.get("claimed_session_id") or "")
+    claimed_task = str(armed_after.get("claimed_task_id") or "")
     disarm()
 
     replayed: list[dict[str, Any]] = []
@@ -515,27 +617,22 @@ def run_case(case: dict[str, Any], *, model: str | None = None, timeout: int | N
         "fixture_hits": served,
         "fixture_exact": exact,
         "fixture_total": len(replayed),
+        "live_calls_executed": max(0, len(case.get("tool_calls") or []) - served),
         "expectations": check_expectations(case.get("expect", []), output),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
     }
     stale_armed = armed_case()
     if stale_armed is not None:
         disarm()
-    if case.get("tool_calls") and not replayed:
+    note = live_execution_error(
+        claimed_session=claimed_session or claimed_task,
+        recorded_total=len(case.get("tool_calls") or []),
+        served=served,
+        replay_calls=len(replayed),
+    )
+    if note:
         result["verdict"] = "error"
-        if claimed_session:
-            result["error"] = (
-                "no pre_tool_call activity during the replay: this runtime never consulted the "
-                "hook, so the case's tool calls would have executed for real. Run /regress "
-                "selftest in the runtime that serves your turns."
-            )
-        else:
-            result["error"] = (
-                "the replay's own turn never claimed the armed case, so session scoping never "
-                "applied and its tool calls ran for real. That means the runtime did not fire "
-                "pre_llm_call/pre_tool_call for this turn, or the prompt no longer matches the "
-                "recorded one."
-            )
+        result["error"] = note
         shutil.rmtree(workdir, ignore_errors=True)
         return result
     result["verdict"] = verdict_for(result, case, cfg)
@@ -559,9 +656,9 @@ def run_suite(*, model: str | None = None, case_id: str | None = None, limit: in
             progress(index, len(cases), case)
         results.append(run_case(case, model=model, timeout=timeout, cfg=cfg,
                                extra_args=extra_args))
-        if str(results[-1].get("error", "")).startswith(
-                ("no pre_tool_call activity", "the replay's own turn never claimed")):
-            # Every remaining case would execute its tools for real. Stop here.
+        if results[-1].get("live_calls_executed"):
+            # This case executed real tools. Every remaining case would too, so
+            # stop rather than pile more live side effects on top.
             break
     summary = summarize(results)
     payload = {

@@ -18,6 +18,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -42,18 +44,45 @@ def regress_home() -> Path:
 
     get_hermes_home() is the same resolver the rest of Hermes uses, so a
     gateway running several profiles writes each profile's cases into that
-    profile's home instead of one shared ~/.hermes/regress.
+    profile's home. There is no second override and no ~/.hermes fallback: a
+    plugin that guesses the home can write one profile's cases into another.
     """
-    override = os.environ.get("HERMES_REGRESS_HOME")
-    if override:
-        return Path(override).expanduser()
+    return Path(_hermes_home()).expanduser() / "plugin-data" / "hermes-regress"
+
+
+def _hermes_home() -> str:
+    """get_hermes_home(), importing it from the Hermes install when needed.
+
+    Inside the gateway the module is already importable. A headless run like
+    ``python3 rg_cli.py run`` starts outside Hermes, so it locates the install
+    from the ``hermes`` executable rather than guessing a home directory.
+    """
     try:
         from hermes_constants import get_hermes_home
+    except ImportError:
+        found = shutil.which("hermes") or ""
+        if found:
+            for parent in Path(found).resolve().parents:
+                if (parent / "hermes_constants.py").exists():
+                    if str(parent) not in sys.path:
+                        sys.path.insert(0, str(parent))
+                    break
+        from hermes_constants import get_hermes_home
 
-        base = Path(get_hermes_home())
-    except Exception:
-        base = Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
-    return base.expanduser() / "plugin-data" / "hermes-regress"
+    return get_hermes_home()
+
+
+def write_private(path: Path, text: str) -> Path:
+    """Write a file readable only by its owner, replacing it atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    return path
 
 
 def ensure_dirs() -> Path:
@@ -79,7 +108,7 @@ def save_config(patch: dict[str, Any]) -> dict[str, Any]:
     cfg = load_config()
     cfg.update(patch)
     home = ensure_dirs()
-    (home / "config.json").write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n", "utf-8")
+    write_private(home / "config.json", json.dumps(cfg, indent=2, sort_keys=True) + "\n")
     return cfg
 
 
@@ -160,8 +189,7 @@ def run_dir(run_id: str, create: bool = False) -> Path:
 
 def save_run(run_id: str, payload: dict[str, Any]) -> Path:
     path = run_dir(run_id, create=True) / "results.json"
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", "utf-8")
-    return path
+    return write_private(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def load_run(run_id: str) -> dict[str, Any] | None:

@@ -22,16 +22,15 @@ import rg_store as store  # noqa: E402
 class TempHome(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self._old = os.environ.get("HERMES_REGRESS_HOME")
-        os.environ["HERMES_REGRESS_HOME"] = self._tmp.name
+        # regress_home() derives from the active Hermes home and has no env
+        # override, so tests point the resolver at a temp dir instead.
+        self._real_home = store.regress_home
+        store.regress_home = lambda: Path(self._tmp.name)  # type: ignore[assignment]
         rg_replay.disarm()
 
     def tearDown(self) -> None:
         rg_replay.disarm()
-        if self._old is None:
-            os.environ.pop("HERMES_REGRESS_HOME", None)
-        else:
-            os.environ["HERMES_REGRESS_HOME"] = self._old
+        store.regress_home = self._real_home  # type: ignore[assignment]
         self._tmp.cleanup()
 
     def make_case(self, **over) -> dict:
@@ -233,10 +232,11 @@ class ReviewFixes(TempHome):
         self.assertEqual(rg_replay.serve(tool_name=call["tool"], args=call["args"],
                                          session_id="some-other-chat"), {})
         # Only a turn carrying the recorded prompt may claim the case.
-        rg_replay.claim_session(session_id="other-session",
+        rg_replay.claim_session(session_id="other-session", is_first_turn=True,
                                 user_message="something completely unrelated")
         self.assertEqual(rg_replay.armed_case()["claimed_session_id"], "")
-        rg_replay.claim_session(session_id="replay-session", user_message=case["prompt"])
+        rg_replay.claim_session(session_id="replay-session", is_first_turn=True,
+                                user_message=case["prompt"])
         self.assertEqual(rg_replay.armed_case()["claimed_session_id"], "replay-session")
 
         # Every other session is untouched, even with the case armed.
@@ -260,9 +260,96 @@ class ReviewFixes(TempHome):
     def test_claim_happens_once_and_ignores_later_turns(self) -> None:
         case = self.make_case()
         rg_replay.arm(case)
-        rg_replay.claim_session(session_id="first", user_message=case["prompt"])
-        rg_replay.claim_session(session_id="second", user_message=case["prompt"])
+        rg_replay.claim_session(session_id="first", is_first_turn=True, user_message=case["prompt"])
+        rg_replay.claim_session(session_id="second", is_first_turn=True, user_message=case["prompt"])
         self.assertEqual(rg_replay.armed_case()["claimed_session_id"], "first")
+
+    def test_claim_requires_first_turn(self) -> None:
+        """A later turn in an existing chat can repeat the prompt; it must not claim."""
+        case = self.make_case()
+        rg_replay.arm(case)
+        rg_replay.claim_session(session_id="later", is_first_turn=False,
+                                user_message=case["prompt"])
+        self.assertEqual(rg_replay.armed_case()["claimed_session_id"], "")
+        rg_replay.claim_session(session_id="first", is_first_turn=True,
+                                user_message=case["prompt"])
+        self.assertEqual(rg_replay.armed_case()["claimed_session_id"], "first")
+
+    def test_shared_prefix_does_not_claim(self) -> None:
+        """A cron or skill turn sharing the opening words must not take the case."""
+        case = self.make_case(prompt="Summarise the release notes for version 4 and list the "
+                                     "breaking changes with file names and owners.")
+        rg_replay.arm(case)
+        prefix = " ".join(case["prompt"].split()[:8])
+        rg_replay.claim_session(session_id="cron", is_first_turn=True,
+                                user_message=prefix + " then email them to the team")
+        self.assertEqual(rg_replay.armed_case()["claimed_session_id"], "")
+
+    def test_full_prompt_is_stored_not_truncated(self) -> None:
+        long_prompt = "word " * 1200 + "final sentinel phrase"
+        case = self.make_case(prompt=long_prompt)
+        rg_replay.arm(case)
+        stored = rg_replay.armed_case()["prompt"]
+        self.assertEqual(stored, " ".join(long_prompt.split()))
+        rg_replay.claim_session(session_id="s1", is_first_turn=True, user_message=long_prompt)
+        self.assertEqual(rg_replay.armed_case()["claimed_session_id"], "s1")
+
+    def test_task_id_keeps_a_compressed_turn_in_scope(self) -> None:
+        """Context compression changes session_id mid-turn; task_id must hold the veto."""
+        case = self.make_case()
+        call = case["tool_calls"][0]
+        rg_replay.arm(case)
+        rg_replay.claim_session(session_id="s1", task_id="t1", is_first_turn=True,
+                                user_message=case["prompt"])
+        self.assertEqual(rg_replay.armed_case()["claimed_task_id"], "t1")
+        # Same task, new session id: the call is still the replay's own.
+        out = rg_replay.serve(tool_name=call["tool"], args=call["args"],
+                             session_id="s2", task_id="t1")
+        self.assertEqual(out.get("action"), "block")
+        self.assertEqual(out.get("message"), call["result"])
+        # A different task is not.
+        self.assertEqual(rg_replay.serve(tool_name=call["tool"], args=call["args"],
+                                         session_id="s2", task_id="t2"), {})
+
+    def test_late_claim_does_not_resurrect_a_disarmed_window(self) -> None:
+        case = self.make_case()
+        rg_replay.arm(case)
+        rg_replay.disarm()
+        rg_replay.claim_session(session_id="s1", is_first_turn=True, user_message=case["prompt"])
+        self.assertIsNone(rg_replay.armed_case())
+        self.assertFalse(rg_replay.arm_path().exists())
+
+    def test_live_execution_is_reported_after_the_case(self) -> None:
+        """A partly served run must say the rest ran for real, not pass quietly."""
+        self.assertIn("never claimed",
+                      rg_replay.live_execution_error(claimed_session="", recorded_total=3,
+                                                     served=0, replay_calls=0))
+        self.assertIn("ran for real",
+                      rg_replay.live_execution_error(claimed_session="s1", recorded_total=3,
+                                                     served=0, replay_calls=0))
+        partial = rg_replay.live_execution_error(claimed_session="s1", recorded_total=3,
+                                                 served=1, replay_calls=2)
+        self.assertIn("only 1 of 3", partial)
+        self.assertIn("ran for real", partial)
+        self.assertEqual(rg_replay.live_execution_error(claimed_session="s1", recorded_total=3,
+                                                        served=3, replay_calls=3), "")
+        self.assertEqual(rg_replay.live_execution_error(claimed_session="s1", recorded_total=0,
+                                                        served=0, replay_calls=0), "")
+
+    def test_artifacts_are_owner_only(self) -> None:
+        case = self.make_case()
+        store.save_case(case)
+        run_id = store.new_run_id()
+        store.save_run(run_id, {"run_id": run_id, "results": []})
+        import rg_report
+
+        payload = {"run_id": run_id, "model": "m", "created_at": "now", "results": []}
+        bundle = rg_report.export_bundle(payload)
+        mode = lambda path: oct(path.stat().st_mode & 0o777)
+        self.assertEqual(mode(store.regress_home() / "cases" / f"{case['case_id']}.json"),
+                         "0o600")
+        self.assertEqual(mode(store.run_dir(run_id) / "results.json"), "0o600")
+        self.assertEqual(mode(bundle), "0o600")
 
     def test_hook_fails_closed_on_internal_error(self) -> None:
         case = self.make_case()
